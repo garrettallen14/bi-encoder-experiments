@@ -1,42 +1,26 @@
 import torch
-from torch.utils.data import Dataset
-from utils.common_utils import load_pickle
-from ..config import Config
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from config import Config
 
-class IRDataset(Dataset):
-    def __init__(self, data_path, corpus_path, neg_path, tokenizer, max_length=320, is_train=True, is_symmetric=False):
-        self.data = load_pickle(data_path)
-        self.corpus = load_pickle(corpus_path)
-        self.neg_samples = load_pickle(neg_path) if is_train else None
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.is_train = is_train
-        self.is_symmetric = is_symmetric
+class TeacherModel(nn.Module):
+    def __init__(self, model_name):
+        super().__init__()
+        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def __len__(self):
-        return len(self.data)
+    def forward(self, queries, documents, is_symmetric):
+        prompts = []
+        for q, d, sym in zip(queries, documents, is_symmetric):
+            if sym:
+                prompt = f"#Q和#P将分别描述一种事件或问题，它们可能并无关系。仅使用此描述和您对世界的了解，判断#P是不是一个关于#Q中的事件绝对正确的句子，或者#P是不是绝对正确地描述了#Q的事件或问题，请回答是或不是，若您不确定，请回答不是。\n#Q：{q}\n#P：{d}\n回答："
+            else:
+                prompt = f"#Q将描述一个问题，#A将描述一个网络段落，它们可能并没有关系。仅依据这些描述和您对世界的了解，判断#A能不能正确地回答#Q中提出的问题，请回答能或不能。\n#Q：{q}\n#A：{d}\n回答："
+            prompts.append(prompt)
 
-    def __getitem__(self, idx):
-        query, pos_doc_id = self.data[idx]
-        pos_doc = self.corpus[pos_doc_id]
-        
-        if self.is_train:
-            neg_doc_ids = self.neg_samples[query][:Config.NUM_NEGATIVES]
-            neg_docs = [self.corpus[neg_id] for neg_id in neg_doc_ids]
-            return query, pos_doc, neg_docs, self.is_symmetric
-        return query, pos_doc, self.is_symmetric
+        inputs = self.tokenizer(prompts, padding=True, truncation=True, max_length=Config.MAX_SEQ_LENGTH, return_tensors='pt').to(self.model.device)
+        outputs = self.model(**inputs)
+        return outputs.logits[:, -1, :]  # Last token logits
 
-def collate_fn(batch):
-    if len(batch[0]) == 4:  # Training
-        queries, pos_docs, neg_docs, is_symmetric = zip(*batch)
-        neg_docs = [doc for sublist in neg_docs for doc in sublist]  # Flatten neg_docs
-    else:  # Validation
-        queries, pos_docs, is_symmetric = zip(*batch)
-        neg_docs = []
-
-    return {
-        'queries': queries,
-        'pos_docs': pos_docs,
-        'neg_docs': neg_docs,
-        'is_symmetric': is_symmetric
-    }
+    def get_features(self, input_ids):
+        return self.model.get_input_embeddings()(input_ids)
